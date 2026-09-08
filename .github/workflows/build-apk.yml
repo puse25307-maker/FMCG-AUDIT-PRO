@@ -12,16 +12,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------------------------------------------------
-      # 1. Checkout
-      # ---------------------------------------------------------
+
+      # =========================================================
+      # 1. CHECKOUT
+      # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # 2. Extract the FMCG-AuditPro ZIP
-      # ---------------------------------------------------------
-      - name: Extract FMCG-AuditPro
+      # =========================================================
+      # 2. EXTRACT YOUR FMCG-AUDITPRO ZIP
+      # =========================================================
+      - name: Extract FMCG-AuditPro ZIP
         shell: bash
         run: |
           set -e
@@ -29,20 +30,19 @@ jobs:
           ZIP=$(find . -maxdepth 2 -type f -iname "fmcg-auditpro*.zip" | head -n 1)
 
           if [ -z "$ZIP" ]; then
-            echo "ERROR: FMCG-AuditPro ZIP not found."
+            echo "ERROR: FMCG-AuditPro ZIP was not found."
             exit 1
           fi
 
-          echo "Using ZIP: $ZIP"
+          echo "Using: $ZIP"
 
           mkdir -p extracted
           unzip -o "$ZIP" -d extracted
 
-          # Find package.json
           PROJECT_DIR=$(find extracted -name package.json -type f -printf '%h\n' | head -n 1)
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: package.json not found."
+            echo "ERROR: package.json was not found inside ZIP."
             exit 1
           fi
 
@@ -51,36 +51,40 @@ jobs:
           shopt -s dotglob
           cp -R "$PROJECT_DIR"/* .
 
-          echo "Project root:"
+          echo "Project successfully extracted."
           ls -la
 
-      # ---------------------------------------------------------
-      # 3. Node 20
-      # ---------------------------------------------------------
+      # =========================================================
+      # 3. NODE
+      # =========================================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: "22"
 
-      # ---------------------------------------------------------
-      # 4. Java 21
-      # ---------------------------------------------------------
+      # =========================================================
+      # 4. JAVA 21
+      #
+      # IMPORTANT:
+      # NO Gradle cache here.
+      # The Android project does not exist yet at this point.
+      # =========================================================
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
-          cache: gradle
 
-      - name: Verify Java
+      - name: Verify Java and Node
         run: |
           java -version
           javac -version
+          node --version
+          npm --version
 
-      # ---------------------------------------------------------
-      # 5. Install dependencies
-      # ---------------------------------------------------------
+      # =========================================================
+      # 5. INSTALL DEPENDENCIES
+      # =========================================================
       - name: Install dependencies
         run: |
           npm install --legacy-peer-deps
@@ -94,106 +98,118 @@ jobs:
             --save-dev @capacitor/cli \
             --legacy-peer-deps
 
-      # ---------------------------------------------------------
-      # 6. Configure backend URL
-      #
-      # IMPORTANT:
-      # Add VITE_BACKEND_URL in:
-      # GitHub → Settings → Secrets and variables → Actions
-      #
-      # Example:
-      # https://your-backend.onrender.com
-      # ---------------------------------------------------------
-      - name: Configure backend URL
+      # =========================================================
+      # 6. REQUIRE BACKEND URL
+      # =========================================================
+      - name: Check backend URL
         shell: bash
         env:
           BACKEND_URL: ${{ secrets.VITE_BACKEND_URL }}
         run: |
-          set -e
-
           if [ -z "$BACKEND_URL" ]; then
-            echo "ERROR: VITE_BACKEND_URL secret is missing."
             echo ""
-            echo "Add this GitHub Actions secret:"
-            echo "VITE_BACKEND_URL=https://YOUR-BACKEND-URL"
+            echo "======================================================"
+            echo "ERROR: VITE_BACKEND_URL secret is missing."
+            echo "======================================================"
+            echo ""
+            echo "Go to:"
+            echo "GitHub → Settings → Secrets and variables → Actions"
+            echo ""
+            echo "Create repository secret:"
+            echo ""
+            echo "Name:"
+            echo "VITE_BACKEND_URL"
+            echo ""
+            echo "Value:"
+            echo "https://YOUR-DEPLOYED-BACKEND-URL"
+            echo ""
             exit 1
           fi
 
-          echo "Backend URL configured."
+          echo "Backend URL is configured."
 
-          # Create a small API helper.
-          mkdir -p src/lib
+      # =========================================================
+      # 7. CONNECT FRONTEND API CALLS TO BACKEND
+      #
+      # Your current source uses:
+      #
+      # fetch('/api/analyze')
+      # fetch('/api/inspections')
+      #
+      # Inside an APK these must go to the deployed backend.
+      # We install a small fetch bridge instead of modifying
+      # every page manually.
+      # =========================================================
+      - name: Configure mobile API bridge
+        env:
+          BACKEND_URL: ${{ secrets.VITE_BACKEND_URL }}
+        shell: bash
+        run: |
+          set -e
 
-          cat > src/lib/api.ts <<'EOF'
-          export const API_BASE_URL =
-            (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
-
-          export function apiUrl(path: string) {
-            return `${API_BASE_URL}${path}`;
-          }
-          EOF
-
-          # Replace relative API calls with apiUrl(...)
           python3 <<'PY'
           from pathlib import Path
-          import re
 
-          files = list(Path("src").rglob("*.tsx")) + list(Path("src").rglob("*.ts"))
+          main = Path("src/main.tsx")
 
-          for p in files:
-              if p.as_posix().endswith("src/lib/api.ts"):
-                  continue
+          original = main.read_text()
 
-              text = p.read_text()
+          bridge = r'''
+          /*
+           * FMCG-AuditPro Android/API bridge.
+           * Relative /api/* requests are redirected to the
+           * deployed backend configured by VITE_BACKEND_URL.
+           */
 
-              # Add import when API calls exist.
-              if "/api/" not in text:
-                  continue
+          const FMCG_API_BASE =
+            (import.meta.env.VITE_BACKEND_URL || "").replace(/\/+$/, "");
 
-              if "from '../lib/api'" in text or 'from "../lib/api"' in text or \
-                 "from '@/lib/api'" in text or 'from "@/lib/api"' in text:
-                  pass
-              else:
-                  depth = len(p.relative_to("src").parts) - 1
-                  prefix = "../" * depth
-                  text = f"import {{ apiUrl }} from '{prefix}lib/api';\n" + text
+          if (FMCG_API_BASE) {
+            const nativeFetch = window.fetch.bind(window);
 
-              # fetch('/api/...')
-              text = re.sub(
-                  r"fetch\(\s*(['\"])\/api\/([^'\"]+)\1",
-                  r"fetch(apiUrl('/api/\2')",
-                  text
-              )
+            window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+              if (typeof input === "string" && input.startsWith("/api/")) {
+                input = FMCG_API_BASE + input;
+              } else if (input instanceof URL && input.pathname.startsWith("/api/")) {
+                input = new URL(FMCG_API_BASE + input.pathname + input.search);
+              }
 
-              # fetch(`/api/...)
-              text = re.sub(
-                  r"fetch\(\s*`\/api\/([^`]+)`",
-                  r"fetch(apiUrl(`/api/\1`)",
-                  text
-              )
+              return nativeFetch(input, init);
+            };
+          }
+          '''
 
-              p.write_text(text)
+          # Avoid duplicate bridge if workflow is ever rerun.
+          if "FMCG_API_BASE" not in original:
+              main.write_text(bridge + "\n" + original)
 
-          print("API URL configuration completed.")
+          print("Mobile API bridge installed.")
           PY
 
-      # ---------------------------------------------------------
-      # 7. Build web application
-      # ---------------------------------------------------------
+      # =========================================================
+      # 8. BUILD WEB APPLICATION
+      # =========================================================
       - name: Build web application
         env:
           VITE_BACKEND_URL: ${{ secrets.VITE_BACKEND_URL }}
         run: |
           npm run build
 
-          test -d dist
-          test -f dist/index.html
+          if [ ! -d "dist" ]; then
+            echo "ERROR: dist directory was not created."
+            exit 1
+          fi
+
+          if [ ! -f "dist/index.html" ]; then
+            echo "ERROR: dist/index.html was not created."
+            exit 1
+          fi
 
           echo "Web build successful."
 
-      # ---------------------------------------------------------
-      # 8. Create Capacitor configuration
-      # ---------------------------------------------------------
+      # =========================================================
+      # 9. CREATE CAPACITOR CONFIG
+      # =========================================================
       - name: Create Capacitor configuration
         run: |
           cat > capacitor.config.ts <<'EOF'
@@ -203,23 +219,18 @@ jobs:
             appId: 'com.fmcg.auditpro',
             appName: 'FMCG-AuditPro',
             webDir: 'dist',
-            bundledWebRuntime: false,
 
             android: {
               allowMixedContent: false
-            },
-
-            server: {
-              cleartext: false
             }
           };
 
           export default config;
           EOF
 
-      # ---------------------------------------------------------
-      # 9. Create Android project
-      # ---------------------------------------------------------
+      # =========================================================
+      # 10. CREATE ANDROID PROJECT
+      # =========================================================
       - name: Create Android project
         run: |
           rm -rf android
@@ -228,9 +239,9 @@ jobs:
 
           npx cap sync android
 
-      # ---------------------------------------------------------
-      # 10. Verify Capacitor Android project
-      # ---------------------------------------------------------
+      # =========================================================
+      # 11. VERIFY ANDROID PROJECT
+      # =========================================================
       - name: Verify Android project
         run: |
           test -f android/gradlew
@@ -239,25 +250,25 @@ jobs:
           chmod +x android/gradlew
 
           cd android
+
           ./gradlew --version
 
-      # ---------------------------------------------------------
-      # 11. Build APK
-      # ---------------------------------------------------------
+      # =========================================================
+      # 12. BUILD DEBUG APK
+      # =========================================================
       - name: Build Debug APK
         run: |
           cd android
 
           chmod +x gradlew
 
-          ./gradlew \
-            assembleDebug \
-            --stacktrace \
-            --no-daemon
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace
 
-      # ---------------------------------------------------------
-      # 12. Verify APK exists
-      # ---------------------------------------------------------
+      # =========================================================
+      # 13. VERIFY APK
+      # =========================================================
       - name: Verify APK
         run: |
           APK="android/app/build/outputs/apk/debug/app-debug.apk"
@@ -267,15 +278,18 @@ jobs:
             exit 1
           fi
 
-          echo "APK successfully generated:"
+          echo ""
+          echo "=============================================="
+          echo "FMCG-AuditPro APK CREATED SUCCESSFULLY"
+          echo "=============================================="
           ls -lh "$APK"
 
-      # ---------------------------------------------------------
-      # 13. Upload APK
-      # ---------------------------------------------------------
-      - name: Upload FMCG-AuditPro APK
+      # =========================================================
+      # 14. UPLOAD APK
+      # =========================================================
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FMCG-AuditPro-Android
+          name: FMCG-AuditPro-Android-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
