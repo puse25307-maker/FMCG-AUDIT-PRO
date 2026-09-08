@@ -13,6 +13,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Extract Project ZIP
+        run: |
+          unzip -o "fmcg-auditpro*.zip"
+          # Move files to root if the zip contained a top-level directory
+          if [ ! -f package.json ]; then
+            DIR=$(find . -mindepth 2 -name "package.json" -printf '%h\n' | head -n 1)
+            if [ -n "$DIR" ]; then
+              shopt -s dotglob
+              mv "$DIR"/* .
+            fi
+          fi
+          ls -la
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -26,9 +39,9 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          npm install
-          npm install @capacitor/core @capacitor/android
-          npm install -D @capacitor/cli
+          npm install --legacy-peer-deps
+          npm install @capacitor/core @capacitor/android --legacy-peer-deps
+          npm install -D @capacitor/cli --legacy-peer-deps
 
       - name: Build Web Assets
         env:
